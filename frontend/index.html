@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chat</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        [x-cloak] { display: none !important; }
+        .prose p { margin: 0.5em 0; }
+        .prose p:first-child { margin-top: 0; }
+        .prose p:last-child { margin-bottom: 0; }
+        .prose pre { background: #f3f4f6; padding: 0.75em; border-radius: 0.5em; overflow-x: auto; margin: 0.5em 0; }
+        .prose code { font-size: 0.875em; }
+        .prose ul, .prose ol { padding-left: 1.5em; margin: 0.5em 0; }
+    </style>
+</head>
+<body class="bg-gray-50 h-screen flex flex-col" x-data="chat()" x-cloak>
+
+    <header class="bg-white border-b px-6 py-3 flex items-center justify-between shrink-0">
+        <h1 class="text-lg font-semibold text-gray-800">Chat</h1>
+        <div class="flex items-center gap-4">
+            <span class="text-sm text-gray-500" x-text="currentUser"></span>
+            <a href="/.auth/logout" class="text-sm text-gray-400 hover:text-red-600">Sign out</a>
+        </div>
+    </header>
+
+    <main class="flex-1 overflow-y-auto px-4 py-6" x-ref="messages">
+        <div class="max-w-3xl mx-auto space-y-4">
+            <template x-if="messages.length === 0 && !loading">
+                <div class="text-center text-gray-400 mt-20">
+                    <p class="text-lg">Start a conversation</p>
+                </div>
+            </template>
+
+            <template x-for="msg in messages" :key="msg.id">
+                <div :class="msg.role === 'user' ? 'flex justify-end' : 'flex justify-start'">
+                    <div :class="{
+                        'bg-blue-600 text-white rounded-2xl rounded-br-sm px-4 py-2 max-w-[75%]': msg.role === 'user',
+                        'bg-white border rounded-2xl rounded-bl-sm px-4 py-2 max-w-[75%] prose': msg.role === 'assistant',
+                        'bg-red-50 border border-red-200 text-red-700 rounded-2xl px-4 py-2 max-w-[75%] text-sm': msg.role === 'error'
+                    }"
+                    x-html="msg.role === 'assistant' ? renderMarkdown(msg.content) : escapeHtml(msg.content)">
+                    </div>
+                </div>
+            </template>
+
+            <div x-show="loading" class="flex justify-start">
+                <div class="bg-white border rounded-2xl rounded-bl-sm px-4 py-3">
+                    <div class="flex gap-1">
+                        <span class="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style="animation-delay: 0ms"></span>
+                        <span class="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style="animation-delay: 150ms"></span>
+                        <span class="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style="animation-delay: 300ms"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <footer class="border-t bg-white px-4 py-4 shrink-0">
+        <form @submit.prevent="send" class="max-w-3xl mx-auto flex gap-3">
+            <input type="text" x-model="input"
+                placeholder="Type a message..."
+                class="flex-1 border border-gray-300 rounded-xl px-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                :disabled="loading"
+                x-ref="input">
+            <button type="submit" :disabled="loading || !input.trim()"
+                class="bg-blue-600 text-white px-5 py-2.5 rounded-xl font-medium hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+                Send
+            </button>
+        </form>
+    </footer>
+
+    <script>
+    function chat() {
+        return {
+            currentUser: '',
+            messages: [],
+            input: '',
+            loading: false,
+            msgId: 0,
+
+            async init() {
+                // Try Easy Auth endpoint (works on both SWA and Container Apps)
+                try {
+                    const res = await fetch('/.auth/me');
+                    const data = await res.json();
+                    // Static Web Apps format
+                    if (data.clientPrincipal) {
+                        this.currentUser = data.clientPrincipal.userDetails;
+                    }
+                    // Container Apps format
+                    else if (Array.isArray(data) && data.length > 0) {
+                        this.currentUser = data[0].user_id;
+                    }
+                } catch {}
+
+                // Fallback: Container App /api/me endpoint
+                if (!this.currentUser) {
+                    try {
+                        const res = await fetch('/api/me');
+                        const data = await res.json();
+                        this.currentUser = data.name || '';
+                    } catch {}
+                }
+
+                this.$refs.input.focus();
+            },
+
+            escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            },
+
+            renderMarkdown(text) {
+                return marked.parse(text || '');
+            },
+
+            scrollToBottom() {
+                this.$nextTick(() => {
+                    this.$refs.messages.scrollTop = this.$refs.messages.scrollHeight;
+                });
+            },
+
+            async send() {
+                const content = this.input.trim();
+                if (!content || this.loading) return;
+
+                this.messages.push({ id: ++this.msgId, role: 'user', content });
+                this.input = '';
+                this.loading = true;
+                this.scrollToBottom();
+
+                try {
+                    const res = await fetch('/api/chat', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            messages: this.messages
+                                .filter(m => m.role !== 'error')
+                                .map(m => ({ role: m.role, content: m.content }))
+                        })
+                    });
+
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+                    const assistantMsg = { id: ++this.msgId, role: 'assistant', content: '' };
+                    this.messages.push(assistantMsg);
+                    this.loading = false;
+                    this.scrollToBottom();
+
+                    const reader = res.body.getReader();
+                    const decoder = new TextDecoder();
+
+                    while (true) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        assistantMsg.content += decoder.decode(value, { stream: true });
+                        this.scrollToBottom();
+                    }
+                } catch (err) {
+                    this.loading = false;
+                    this.messages.push({
+                        id: ++this.msgId, role: 'error',
+                        content: 'Failed to reach the chat API. Check your connection and try again.'
+                    });
+                    this.scrollToBottom();
+                }
+
+                this.$refs.input.focus();
+            }
+        };
+    }
+    </script>
+</body>
+</html>
