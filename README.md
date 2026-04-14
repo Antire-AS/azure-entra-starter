@@ -1,8 +1,8 @@
 # Azure Entra Starter
 
-Starter template for Azure-hosted apps protected by Entra ID (Azure AD) authentication. Includes a working chat interface as the example app, Terraform infrastructure, and Easy Auth configuration.
+Starter template for Azure-hosted apps protected by Entra ID (Azure AD) authentication. Includes a working chat interface as the example app, Terraform infrastructure, and two different auth approaches: Easy Auth (platform-managed) and MSAL (client-side).
 
-Pick one of two deployment options:
+Pick one of three deployment options:
 
 ### Option A: Static Web App
 
@@ -18,19 +18,27 @@ For teams that need more control. You package your app in a Docker container and
 
 Best for: apps with heavier backend logic, teams already using Docker, projects that need service-to-service API access, or apps that may grow beyond what static hosting supports.
 
+### Option C: MSAL App (client-side auth)
+
+For teams that want full control over the authentication flow. Instead of relying on Azure's built-in Easy Auth proxy, your frontend handles login using Microsoft's MSAL.js library and your backend validates tokens directly. Same Docker-based hosting as Option B, but authentication lives in your code, not in Azure infrastructure.
+
+Best for: apps that may run outside Azure, teams that want to customize the login experience, SPAs that need fine-grained token control, or projects where you want to understand exactly what the auth code does.
+
 ### Comparison
 
-|                          | Static Web App              | Container App                  |
-|--------------------------|-----------------------------|--------------------------------|
-| **Hosting**              | Azure Static Web Apps       | Azure Container Apps           |
-| **Backend**              | Azure Functions (Node.js)   | FastAPI (Python)               |
-| **Auth**                 | Easy Auth (platform)        | Easy Auth (platform)           |
-| **Streaming responses**  | No (SWA proxy buffers)      | Yes                            |
-| **Cost**                 | ~$9/mo (Standard plan)      | Pay-per-use (scales to zero)   |
-| **Docker**               | Not needed                  | Required                       |
-| **Agent/service access** | Not supported               | Yes (client credentials flow)  |
+|                          | Static Web App              | Container App                  | MSAL App                        |
+|--------------------------|-----------------------------|--------------------------------|---------------------------------|
+| **Hosting**              | Azure Static Web Apps       | Azure Container Apps           | Azure Container Apps            |
+| **Backend**              | Azure Functions (Node.js)   | FastAPI (Python)               | FastAPI (Python)                |
+| **Auth**                 | Easy Auth (platform)        | Easy Auth (platform)           | MSAL.js (client-side)           |
+| **Auth code in your app**| None                        | None                           | Yes (frontend + backend)        |
+| **Streaming responses**  | No (SWA proxy buffers)      | Yes                            | Yes                             |
+| **Cost**                 | ~$9/mo (Standard plan)      | Pay-per-use (scales to zero)   | Pay-per-use (scales to zero)    |
+| **Docker**               | Not needed                  | Required                       | Required                        |
+| **Portable (non-Azure)** | No (Azure-only feature)     | No (Azure-only feature)        | Yes (auth runs in your code)    |
+| **Agent/service access** | Not supported               | Yes (client credentials flow)  | Yes (client credentials flow)   |
 
-Both options use the same frontend, the same Entra ID Easy Auth pattern, and the same approach to group-based access control. Each has its own self-contained Terraform — no shared modules, easy to read.
+Options A and B use the same frontend, the same Entra ID Easy Auth pattern, and the same approach to group-based access control. Option C uses the same chat UI but handles auth in application code instead of the platform. Each has its own self-contained Terraform — no shared modules, easy to read.
 
 ---
 
@@ -124,6 +132,159 @@ The frontend uses `/.auth/me` to show the username and links to `/.auth/logout` 
 
 ---
 
+## Understanding MSAL
+
+### Why MSAL instead of Easy Auth?
+
+Easy Auth is convenient — zero auth code, the platform handles everything. But it only works on Azure, you can't customize the login experience, and you can't see or control what happens during authentication.
+
+MSAL (Microsoft Authentication Library) is the alternative: your application handles auth directly. The frontend acquires tokens using Microsoft's JavaScript library, and your backend validates them. More code, but also:
+
+- **Portable**: your app can run anywhere (Azure, AWS, on-prem, localhost) — auth doesn't depend on Azure's reverse proxy.
+- **Visible**: you can see every step of the auth flow, debug it, and customize it.
+- **Fine-grained**: you control token scopes, caching, refresh behavior, and error handling.
+- **Testable**: you can test auth logic locally without deploying to Azure.
+
+### What MSAL does
+
+MSAL.js is a JavaScript library that runs in the browser. It handles the OAuth 2.0 authorization code flow with PKCE: redirecting users to Microsoft's login page, receiving the authorization code, exchanging it for tokens, caching them, and silently refreshing them when they expire.
+
+This is not a proxy or infrastructure feature. It's a library loaded in your HTML page, like jQuery or Alpine.js. Your backend receives the token in the `Authorization` header and validates it against Microsoft's published signing keys.
+
+### What happens when a user visits your app
+
+```
+1. First visit (not logged in)
+
+   Browser ──── GET / ────> Your backend ──── serves index.html
+                                                   │
+   Browser runs JavaScript:                        │
+     MSAL checks sessionStorage — no cached account│
+     App shows "Sign in with Microsoft" button      │
+                                                   │
+   User clicks the button                          │
+     MSAL redirects to login.microsoftonline.com   │
+     User enters their organization credentials    │
+
+
+2. After signing in
+
+   Microsoft ── redirects back to ──> Your app's origin URL
+                                           │
+   Browser runs JavaScript:                │
+     MSAL's handleRedirectPromise() runs   │
+     Receives the authorization code       │
+     Exchanges it for tokens via PKCE      │
+     Stores tokens in sessionStorage       │
+     App renders the chat interface        │
+
+
+3. Every subsequent API call
+
+   Browser ──── POST /api/chat ────> Your backend
+                    │                      │
+                    │ Authorization:        │
+                    │ Bearer eyJ0eX...      │
+                    │                      │
+                    │                Your backend:
+                    │                  1. Extracts the token from the header
+                    │                  2. Fetches Microsoft's signing keys (JWKS)
+                    │                  3. Verifies the token signature
+                    │                  4. Checks audience = your app's client ID
+                    │                  5. Checks issuer = your Entra ID tenant
+                    │                  6. Checks the token is not expired
+                    │                  7. If valid → processes the request
+                    │                  8. If invalid → returns 401
+                    │
+   Your backend never redirects to a login page. It never issues tokens.
+   It only validates tokens that the frontend already acquired.
+```
+
+### What your app code actually does
+
+**Frontend** — MSAL handles the login flow. Your code initializes it, calls login, and attaches the token to API requests:
+
+```javascript
+// Initialize MSAL with your app's client ID and tenant ID
+const msalInstance = new msal.PublicClientApplication({
+    auth: {
+        clientId: 'your-client-id',
+        authority: 'https://login.microsoftonline.com/your-tenant-id',
+        redirectUri: window.location.origin,
+    },
+    cache: { cacheLocation: 'sessionStorage' },
+});
+
+// On page load: handle the redirect callback (if returning from Microsoft login)
+const response = await msalInstance.handleRedirectPromise();
+
+// Login: redirect the browser to Microsoft's login page
+await msalInstance.loginRedirect({ scopes: ['User.Read'] });
+
+// Get a token for API calls (uses cache, refreshes silently if expired)
+const tokenResponse = await msalInstance.acquireTokenSilent({
+    scopes: ['User.Read'],
+    account: msalInstance.getAllAccounts()[0],
+});
+
+// Send the token with every API call
+fetch('/api/chat', {
+    headers: { 'Authorization': `Bearer ${tokenResponse.idToken}` },
+    // ...
+});
+```
+
+**Backend** — validates the JWT token on every request. No MSAL library needed on the server — just standard JWT validation:
+
+```python
+import jwt, httpx
+
+# Fetch Microsoft's signing keys (cached, refreshed daily)
+jwks = httpx.get("https://login.microsoftonline.com/{tenant}/discovery/v2.0/keys").json()
+
+# Validate the token from the Authorization header
+claims = jwt.decode(
+    token,
+    key=signing_key,          # from the JWKS, matched by key ID
+    algorithms=["RS256"],
+    audience="your-client-id",
+    issuer="https://login.microsoftonline.com/{tenant}/v2.0",
+)
+user_email = claims["preferred_username"]
+```
+
+Compare this with Easy Auth, where the entire auth code is `request.headers.get("X-MS-CLIENT-PRINCIPAL-NAME")`. MSAL requires more code, but every step is explicit and under your control.
+
+### Tokens: ID tokens vs access tokens
+
+Microsoft issues two types of tokens. Understanding the difference matters for MSAL apps:
+
+| | ID Token | Access Token |
+|---|---|---|
+| **Purpose** | Identifies who the user is | Authorizes access to a specific API |
+| **Contains** | User's email, name, tenant ID | Scopes (permissions) for a target API |
+| **Audience (aud)** | Your app's client ID | The API's resource URI |
+| **Used for** | Authenticating to your own backend | Calling Microsoft Graph or other APIs |
+| **Example** | "This is alice@company.com" | "alice has User.Read permission on Graph" |
+
+In this starter, the frontend sends the **ID token** to your backend. The backend validates that the token is signed by Microsoft, intended for your app, and not expired. That's enough to know who the user is.
+
+Access tokens are used when calling external APIs (like Microsoft Graph to check group membership). The frontend uses them internally — your backend never sees them.
+
+### When to use MSAL vs Easy Auth
+
+| Scenario | Recommendation |
+|----------|---------------|
+| Internal tool, deployed to Azure, minimal auth requirements | **Easy Auth** — zero code, platform handles it |
+| Need auth to work locally during development | **MSAL** — Easy Auth only works when deployed |
+| App may run outside Azure (AWS, on-prem, Docker locally) | **MSAL** — not tied to Azure infrastructure |
+| Need to customize the login page or flow | **MSAL** — full control over the UI |
+| Want to understand exactly how auth works | **MSAL** — every step is in your code |
+| Need to call Microsoft Graph from the frontend | **MSAL** — already has the access tokens |
+| Want the least amount of code possible | **Easy Auth** — literally one header read |
+
+---
+
 ## What is an App Registration?
 
 Before Easy Auth can work, Microsoft needs to know your app exists. An **app registration** is your app's identity in Entra ID — it tells Microsoft "there is an application called X, and it's allowed to use Microsoft login."
@@ -137,6 +298,20 @@ The Terraform in this repo creates the app registration automatically. Here's wh
 | `id_token_issuance_enabled` | `true` | Microsoft will issue ID tokens that identify the user. |
 
 You generally don't need to touch the app registration after Terraform creates it. The one manual step is that an Entra ID admin must add the deploying user as **Owner** of the registration — this is a one-time action documented in the deployment steps.
+
+### App registration differences: Easy Auth vs MSAL
+
+The Terraform creates the app registration for you, but the configuration differs:
+
+| Setting | Easy Auth (Options A/B) | MSAL (Option C) |
+|---------|------------------------|-----------------|
+| Platform type | Web | Single Page Application (SPA) |
+| Redirect URI type | Web (`/.auth/login/aad/callback`) | SPA (app origin URL) |
+| Client secret | Needed for SWA, not for Container App | Not needed (uses PKCE) |
+| Implicit grant | ID tokens enabled | ID tokens enabled |
+| PKCE | Handled by Easy Auth internally | Handled by MSAL.js in the browser |
+
+The SPA platform type tells Entra ID to accept PKCE-based token requests from the browser. No client secret is exchanged — the browser can't keep secrets, so PKCE uses a dynamically generated challenge instead.
 
 ---
 
@@ -305,7 +480,7 @@ az ad group member add --group $GROUP_ID --member-id $USER_ID
 
 #### Step 3: Connect the group to your app
 
-Both options work the same way. Add the group to your Terraform apply:
+All three options work the same way. Add the group to your Terraform apply:
 
 ```bash
 terraform apply \
@@ -494,11 +669,93 @@ Note: This only works with the Container App option. Static Web Apps Easy Auth d
 
 ---
 
+## Option C: MSAL App
+
+Deployment is the same two-pass approach as Option B (registry + Key Vault first, then the Container App). The difference is that there's no Easy Auth configuration — your code handles auth.
+
+### 1. First pass — create registry and Key Vault
+
+```bash
+cd terraform/msal-app
+terraform init
+terraform apply -target=azurerm_container_registry.main -target=azurerm_key_vault.main \
+  -target=azurerm_role_assignment.kv_admin -target=azurerm_log_analytics_workspace.main \
+  -var="resource_group_name=rg-my-chat" \
+  -var="project_name=my-chat" \
+  -var="azure_openai_endpoint=https://YOUR_RESOURCE.openai.azure.com" \
+  -var="azure_openai_deployment=gpt-4o"
+```
+
+### 2. Store the API key
+
+```bash
+az keyvault secret set \
+  --vault-name $(terraform output -raw key_vault_name) \
+  --name azure-openai-api-key \
+  --value YOUR_KEY
+```
+
+### 3. Build and push the Docker image
+
+```bash
+REGISTRY=$(terraform output -raw container_registry)
+PROJECT=my-chat
+
+# From the repo root
+docker build --platform linux/amd64 -f msal-app/Dockerfile -t $REGISTRY/$PROJECT:latest .
+az acr login --name ${REGISTRY%%.*}
+docker push $REGISTRY/$PROJECT:latest
+```
+
+### 4. Second pass — create Container App and app registration
+
+```bash
+terraform apply \
+  -var="resource_group_name=rg-my-chat" \
+  -var="project_name=my-chat" \
+  -var="azure_openai_endpoint=https://YOUR_RESOURCE.openai.azure.com" \
+  -var="azure_openai_deployment=gpt-4o"
+```
+
+### 5. Entra ID admin action
+
+An Entra ID admin must add the deploying user as Owner of the app registration:
+
+Portal -> Entra ID -> App registrations -> my-chat-dev -> Owners -> Add owner
+
+Then re-run `terraform apply` to set the redirect URI.
+
+### 6. Update the frontend with your app's IDs
+
+After terraform apply, get the client ID and tenant ID:
+
+```bash
+terraform output client_id
+terraform output tenant_id
+```
+
+Edit `msal-app/frontend/index.html` and replace the placeholder values:
+
+```javascript
+const CLIENT_ID = '__CLIENT_ID__';   // ← replace with terraform output client_id
+const TENANT_ID = '__TENANT_ID__';   // ← replace with terraform output tenant_id
+```
+
+Then rebuild and push the Docker image (step 3) to deploy the updated frontend.
+
+### Group access control (optional)
+
+Works the same as the Easy Auth options. Add `-var="create_access_group=true"` to `terraform apply`. Non-members are blocked at the Microsoft login page (AADSTS50105) — they never reach your app.
+
+---
+
 ## Local development
+
+### Easy Auth options (A and B)
 
 Note: Easy Auth only works when deployed to Azure. Locally, the `/.auth/me` endpoint won't exist, so the username won't display. The chat API works normally.
 
-### Container App backend
+**Container App backend:**
 
 ```bash
 cd container-app
@@ -513,7 +770,7 @@ uvicorn server:app --reload
 
 Open http://localhost:8000 in your browser.
 
-### Static Web App (SWA CLI)
+**Static Web App (SWA CLI):**
 
 ```bash
 npm install -g @azure/static-web-apps-cli
@@ -523,13 +780,43 @@ swa start frontend --api-location api
 
 The SWA CLI emulates the auth endpoints locally, so `/.auth/me` works in dev.
 
+### MSAL option (C)
+
+MSAL works locally — this is one of its advantages over Easy Auth. You need a separate app registration for localhost (since the redirect URI differs), or you can add `http://localhost:8000` as an additional redirect URI to your existing registration.
+
+**Add localhost redirect URI (one-time setup):**
+
+```
+Portal: Entra ID -> App registrations -> <your app> -> Authentication
+  -> Add a platform -> Single-page application
+  -> Redirect URI: http://localhost:8000
+  -> Save
+```
+
+**Run locally:**
+
+```bash
+cd msal-app
+pip install -r requirements.txt
+cp -r frontend/ static/
+cp ../.env.example .env   # edit with your values, plus:
+# AZURE_TENANT_ID=your-tenant-id
+# AZURE_CLIENT_ID=your-client-id
+
+# Load .env and run
+export $(cat .env | xargs)
+uvicorn server:app --reload
+```
+
+Open http://localhost:8000 in your browser. The full login flow works — you'll be redirected to Microsoft login and back to localhost.
+
 ---
 
 ## Project structure
 
 ```
 azure-entra-starter/
-├── frontend/                         # Shared chat UI (Alpine.js)
+├── frontend/                         # Shared chat UI (Alpine.js) — Easy Auth options
 │   ├── index.html
 │   └── staticwebapp.config.json      # Auth + routing (SWA only)
 ├── api/                              # Azure Functions backend (SWA option)
@@ -542,14 +829,26 @@ azure-entra-starter/
 │   ├── server.py                     # Chat endpoint with streaming
 │   ├── requirements.txt
 │   └── Dockerfile
+├── msal-app/                         # MSAL option — auth in application code
+│   ├── frontend/
+│   │   └── index.html                # Chat UI with MSAL.js login
+│   ├── server.py                     # FastAPI with JWT validation
+│   ├── requirements.txt
+│   └── Dockerfile
 ├── .env.example                      # Environment variables template
 └── terraform/
-    ├── static-web-app/               # Option A: SWA + auth (self-contained)
+    ├── static-web-app/               # Option A: SWA + Easy Auth (self-contained)
     │   ├── main.tf, auth.tf          #   app registration, SWA resource
     │   ├── providers.tf, variables.tf, outputs.tf
-    └── container-app/                # Option B: Container App + auth (self-contained)
-        ├── main.tf, auth.tf          #   app registration, Easy Auth config
-        ├── container.tf              #   ACR, Container App, probes
+    ├── container-app/                # Option B: Container App + Easy Auth (self-contained)
+    │   ├── main.tf, auth.tf          #   app registration, Easy Auth config
+    │   ├── container.tf              #   ACR, Container App, probes
+    │   ├── providers.tf, variables.tf, outputs.tf
+    └── msal-app/                     # Option C: Container App + MSAL (self-contained)
+        ├── auth.tf                   #   SPA app registration (no Easy Auth)
+        ├── main.tf                   #   Key Vault
+        ├── container.tf              #   ACR, Container App (no auth proxy)
+        ├── groups.tf                 #   access control groups
         ├── providers.tf, variables.tf, outputs.tf
 ```
 
@@ -578,15 +877,29 @@ Each option has a small set of `.tf` files. Here's what they contain and why:
 | `variables.tf` | Input variables | Project name, region, OpenAI endpoint/deployment, system prompt. |
 | `outputs.tf` | URL, registry address, client ID, Key Vault name | Values you need after deploy: the app URL, where to push your Docker image, and the Key Vault name for storing secrets. |
 
+### MSAL App (`terraform/msal-app/`)
+
+| File | What it creates | Why |
+|------|----------------|-----|
+| `auth.tf` | SPA app registration, service principal, redirect URI | Registers your app with Entra ID as a Single Page Application. Uses PKCE instead of a client secret — the browser handles login directly. No Easy Auth proxy configured. |
+| `main.tf` | Key Vault, RBAC role assignments | Same as Container App option — stores the OpenAI API key securely. |
+| `container.tf` | Container Registry, Log Analytics, Container App Environment, Container App | Same hosting stack as Container App option, but **without Easy Auth**. The Container App receives all requests directly — your backend validates tokens. Compare with the Easy Auth option to see what's missing (no `azapi_resource` for auth). |
+| `groups.tf` | Security group, role assignment, group members | Same group-based access control as the other options. Entra ID blocks non-members at login, before they ever get a token. |
+| `providers.tf` | Provider versions (azurerm, azuread) | Simpler than Easy Auth — no `azapi` provider needed since there's no auth proxy to configure. |
+| `variables.tf` | Input variables | Same as Container App option. |
+| `outputs.tf` | URL, registry address, client ID, **tenant ID**, Key Vault name | Like Container App, plus tenant ID — you need both client ID and tenant ID to configure the MSAL frontend. |
+
 ## Customization
 
 | What                | How                                                        |
 |---------------------|------------------------------------------------------------|
 | System prompt       | `SYSTEM_PROMPT` env var / Terraform variable               |
 | Model               | `AZURE_OPENAI_DEPLOYMENT` env var / Terraform variable     |
-| Frontend            | Edit `frontend/index.html` — no build step                 |
-| Auth                | Platform-managed via Easy Auth — no app code changes       |
-| Group restrictions  | `create_access_group = true` in Terraform (both options)      |
+| Frontend (A/B)      | Edit `frontend/index.html` — no build step                 |
+| Frontend (C)        | Edit `msal-app/frontend/index.html` — no build step        |
+| Auth (A/B)          | Platform-managed via Easy Auth — no app code changes       |
+| Auth (C)            | MSAL.js in frontend + JWT validation in backend            |
+| Group restrictions  | `create_access_group = true` in Terraform (all options)    |
 
 ## Common questions
 
