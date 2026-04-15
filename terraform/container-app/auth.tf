@@ -125,7 +125,13 @@ resource "azuread_application_redirect_uris" "main" {
 #
 #   globalValidation.unauthenticatedClientAction = "RedirectToLoginPage"
 #     → If someone visits without being signed in, redirect them to Microsoft login.
-#       Alternative: "Return401" would return a 401 error instead of redirecting.
+#       Alternatives:
+#         "Return401" — return a 401 error instead of redirecting.
+#         "AllowAnonymous" — let unauthenticated requests through. The proxy still
+#           injects identity headers for authenticated users, but does not block
+#           anonymous requests. Your app decides which routes need auth.
+#           Use this when some routes must be public (webhooks, health checks)
+#           and others protected (admin UI). See the allow_anonymous variable.
 #
 #   globalValidation.redirectToProvider = "azureactivedirectory"
 #     → Use Entra ID (Azure AD) as the login provider.
@@ -151,7 +157,7 @@ resource "azapi_resource" "container_app_auth" {
         enabled = true
       }
       globalValidation = {
-        unauthenticatedClientAction = "RedirectToLoginPage"
+        unauthenticatedClientAction = var.allow_anonymous ? "AllowAnonymous" : "RedirectToLoginPage"
         redirectToProvider           = "azureactivedirectory"
       }
       identityProviders = {
@@ -170,4 +176,22 @@ resource "azapi_resource" "container_app_auth" {
       }
     }
   }
+}
+
+# --- AllowAnonymous variable ---
+# When true, Easy Auth lets unauthenticated requests through. The proxy still
+# injects identity headers for users who ARE signed in, but does not block
+# anonymous requests. Your application code decides which routes need auth.
+#
+# Use this when your app has both public endpoints (webhooks, health checks,
+# API endpoints called by external services) and protected endpoints (admin UI)
+# living in the same container.
+#
+# With AllowAnonymous, protected routes should check for the
+# X-MS-CLIENT-PRINCIPAL-NAME header and redirect to /.auth/login/aad if absent.
+# See the "Selective route protection" section in server.py for an example.
+variable "allow_anonymous" {
+  description = "Allow unauthenticated requests through Easy Auth. When true, your app must check auth headers on protected routes. When false (default), all routes are protected."
+  type        = bool
+  default     = false
 }
