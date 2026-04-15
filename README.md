@@ -369,8 +369,107 @@ From your app's perspective, the experience is identical. Users log in with Micr
 | Where auth runs | Sidecar proxy next to your container | Built into the platform edge |
 | How it's configured | Terraform `azapi_resource` | `staticwebapp.config.json` + Terraform app settings |
 | Client secret | Not needed | Required |
-| Route-level auth rules | All-or-nothing (all routes protected) | Per-route via `allowedRoles` in config |
+| Route-level auth rules | All-or-nothing by default; per-route with AllowAnonymous (see below) | Per-route via `allowedRoles` in config |
 | User info header | `X-MS-CLIENT-PRINCIPAL-NAME` (plain text) | `x-ms-client-principal` (base64 JSON) |
+
+### Selective route protection on Container Apps (AllowAnonymous)
+
+By default, Easy Auth on Container Apps protects all routes — every request must be authenticated. But sometimes you need some routes to be public (health checks, webhooks, API endpoints called by external services) while others are protected (admin UI, user-facing features).
+
+The solution is `AllowAnonymous` mode. Instead of blocking unauthenticated requests, the Easy Auth proxy lets them through. For authenticated users, it still injects identity headers. For anonymous users, the request passes through with no headers and no redirect.
+
+Your application code then decides which routes need auth:
+
+```python
+def get_user_email(request: Request) -> str | None:
+    """Get the authenticated user's email from Easy Auth headers, or None."""
+    return request.headers.get("X-MS-CLIENT-PRINCIPAL-NAME")
+
+def require_auth(request: Request) -> str:
+    """Require auth — redirect to Microsoft login if not signed in."""
+    email = get_user_email(request)
+    if email:
+        return email
+    # Redirect browser to Microsoft login
+    raise HTTPException(
+        status_code=303,
+        headers={"Location": "/.auth/login/aad?post_login_redirect_uri=" + str(request.url.path)},
+    )
+
+# Public — accessible without signing in
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+# Protected — redirects to Microsoft login if not authenticated
+@app.get("/admin/")
+async def admin(request: Request):
+    user = require_auth(request)
+    return {"admin": "dashboard", "user": user}
+```
+
+The request flow with AllowAnonymous:
+
+```
+Unauthenticated request:
+
+  Browser ── GET /health ──> Easy Auth proxy ──> Your app
+                                  │                 │
+                                  ├─ No cookie      │
+                                  ├─ AllowAnonymous │
+                                  ├─ No headers     │
+                                  ├─ No redirect    │
+                                  └─ Pass through   └─ Returns {"status": "ok"}
+
+
+  Browser ── GET /admin/ ──> Easy Auth proxy ──> Your app
+                                  │                 │
+                                  ├─ No cookie      │
+                                  ├─ AllowAnonymous │
+                                  ├─ No headers     └─ require_auth() sees no header
+                                  ├─ Pass through        → 303 redirect to /.auth/login/aad
+                                  └─────────────────────────────────────────────────────────
+
+  Browser follows redirect to Microsoft login, signs in, returns with cookie.
+
+
+Authenticated request:
+
+  Browser ── GET /admin/ (with cookie) ──> Easy Auth proxy ──> Your app
+                                                │                  │
+                                                ├─ Cookie valid    │
+                                                ├─ Injects:        │
+                                                │  X-MS-CLIENT-PRINCIPAL-NAME: user@company.com
+                                                └─ Pass through    └─ require_auth() sees header
+                                                                       → access granted
+```
+
+To enable AllowAnonymous in Terraform:
+
+```bash
+terraform apply -var="allow_anonymous=true" ...other vars...
+```
+
+Or via the Azure CLI (no Terraform needed):
+
+```bash
+az containerapp auth update \
+  --name <app-name> \
+  --resource-group <rg-name> \
+  --unauthenticated-client-action AllowAnonymous \
+  --enabled true
+```
+
+**When to use AllowAnonymous vs RedirectToLoginPage:**
+
+| Scenario | Mode |
+|----------|------|
+| Every route needs authentication (internal tool, dashboard) | `RedirectToLoginPage` (default) |
+| Some routes must be public (webhooks, health probes, bot endpoints) | `AllowAnonymous` |
+| External services call your API without browser auth | `AllowAnonymous` |
+| Admin UI + public API in the same app | `AllowAnonymous` |
+
+See `container-app/server.py` for the full implementation with `require_auth()` and `get_user_email()` helpers.
 
 ---
 
